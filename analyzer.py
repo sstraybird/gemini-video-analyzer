@@ -1,16 +1,20 @@
 import os
 import sys
 import argparse
+import hashlib
 import logging
 import shutil
 from src.video_processing import (
     extract_frames, 
     get_video_hash, 
     is_youtube_url,
-    download_youtube_video,
-    convert_to_mp4
+    youtube_report_name,
 )
-from src.gemini_analysis import analyze_frames_with_gemini, analyze_video_with_gemini
+from src.gemini_analysis import (
+    analyze_frames_with_gemini,
+    analyze_video_with_gemini,
+    analyze_youtube_with_gemini,
+)
 from src.report_generation import create_output_directory, save_reports
 
 def setup_logging():
@@ -50,8 +54,8 @@ def main():
         choices=['frames', 'video'],
         default='video',
         help='''The method for analysis.
-- frames: Extracts frames as images and analyzes them visually.
-- video:  (Default) Uploads the full video for combined visual and audio analysis.'''
+- frames: Extracts frames from a local file and analyzes them visually.
+- video:  (Default) Combined visual and audio analysis. Local files are uploaded; YouTube URLs are passed to Gemini directly.'''
     )
     
     parser.add_argument("-i", "--interval", type=int, default=1, help="Interval in seconds between frame captures (only used in 'frames' mode).")
@@ -66,43 +70,45 @@ def main():
     for video_input in args.video_inputs:
         logging.info(f"--- Processing input: {video_input} ---")
         
-        processed_video_path = None
         original_filename = ""
+        analysis_md, analysis_json = None, None
 
-        if os.path.exists(video_input):
+        if is_youtube_url(video_input) and not os.path.exists(video_input):
+            if args.analysis_mode == 'frames':
+                logging.error(
+                    "Frame mode needs a local video file. "
+                    "Pass the YouTube URL with the default video mode instead. Skipping."
+                )
+                continue
+            original_filename = youtube_report_name(video_input)
+            url_hash = hashlib.sha256(video_input.encode("utf-8")).hexdigest()
+            logging.info(f"Passing YouTube URL to Gemini without download: {video_input}")
+            logging.info(f"SHA256 of URL for {original_filename}: {url_hash}")
+            analysis_md, analysis_json = analyze_youtube_with_gemini(
+                video_input, args.model, args.focus, args.language
+            )
+        elif os.path.exists(video_input):
             logging.info("Input is a local file.")
             processed_video_path = video_input
             original_filename = os.path.basename(video_input)
-        elif is_youtube_url(video_input):
-            logging.info("Input is a YouTube URL. Starting download...")
-            downloaded_path = download_youtube_video(video_input)
-            if downloaded_path:
-                original_filename = os.path.basename(downloaded_path)
-                processed_video_path = convert_to_mp4(downloaded_path)
+            video_hash = get_video_hash(processed_video_path)
+            if not video_hash:
+                logging.warning(f"Could not hash video {original_filename}. Skipping.")
+                continue
+            logging.info(f"SHA256 Hash for {original_filename}: {video_hash}")
+
+            if args.analysis_mode == 'frames':
+                frames = extract_frames(processed_video_path, args.interval)
+                if frames:
+                    analysis_md, analysis_json = analyze_frames_with_gemini(frames, args.model, args.focus, args.language)
+                else:
+                    logging.warning(f"Frame extraction failed for {original_filename}. Skipping.")
+                    continue
+            else:
+                analysis_md, analysis_json = analyze_video_with_gemini(processed_video_path, args.model, args.focus, args.language)
         else:
             logging.error(f"Input '{video_input}' is not a valid file path or YouTube URL. Skipping.")
             continue
-
-        if not processed_video_path:
-            logging.error(f"Failed to acquire or process video from '{video_input}'. Skipping.")
-            continue
-
-        video_hash = get_video_hash(processed_video_path)
-        if not video_hash:
-            logging.warning(f"Could not hash video {original_filename}. Skipping.")
-            continue
-        logging.info(f"SHA256 Hash for {original_filename}: {video_hash}")
-
-        analysis_md, analysis_json = None, None
-        if args.analysis_mode == 'frames':
-            frames = extract_frames(processed_video_path, args.interval)
-            if frames:
-                analysis_md, analysis_json = analyze_frames_with_gemini(frames, args.model, args.focus, args.language)
-            else:
-                logging.warning(f"Frame extraction failed for {original_filename}. Skipping.")
-                continue
-        elif args.analysis_mode == 'video':
-            analysis_md, analysis_json = analyze_video_with_gemini(processed_video_path, args.model, args.focus, args.language)
 
         if not analysis_md:
             logging.warning(f"Gemini analysis failed for {original_filename}. Skipping report generation.")

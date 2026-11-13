@@ -133,6 +133,71 @@ Finally, after the summary, provide a JSON object containing the key findings. T
         logging.error(f"An error occurred during the Gemini API call: {e}")
         return None, None
 
+def _video_analysis_prompt(focus, language):
+    """Builds the visual-and-audio behavior analysis prompt."""
+    prompt_parts = [
+        "You are an expert in behavioral analysis, skilled in interpreting both visual and auditory cues.",
+        "Analyze the provided video, paying attention to both the visual elements and the audio track."
+    ]
+    if focus:
+        prompt_parts.append(f"Your analysis should focus on: {focus}.")
+    else:
+        prompt_parts.append("Focus on the primary individual visible and audible in the video.")
+
+    prompt_parts.append("Based on their facial expressions, body language, gestures, tone of voice, and speech patterns, please provide a comprehensive report in Markdown format.")
+
+    if language:
+        prompt_parts.append(f"The report must be written in {language}.")
+
+    prompt_parts.append("""
+The report should include the following sections:
+
+## Overall Emotional State
+- A summary of the person's dominant emotional state, considering both visual and auditory cues.
+
+## Sentiment Analysis
+- Classify the overall sentiment as Positive, Negative, or Neutral, justifying your answer with evidence from both video and audio.
+
+## Detailed Observations
+- **Visual Cues:** Describe specific facial expressions, posture, and body movements (e.g., fidgeting, leaning forward, breaking eye contact).
+- **Auditory Cues:** Describe the tone of voice (e.g., wavering, confident, monotone), pace of speech, use of filler words, and any notable pauses or hesitations.
+- **Potential Inferred Feelings:** Infer potential feelings (e.g., nervousness, confidence, deception, honesty) and support your inferences with specific, timestamped examples from the video if possible.
+
+## Confidence Level
+- Assess the person's apparent confidence level on a scale of Low, Medium, or High, explaining your reasoning based on both visual and auditory evidence.
+
+## Summary
+- Conclude with a brief, holistic summary of your findings.
+
+Finally, after the summary, provide a JSON object containing the key findings. The JSON object should be enclosed in a Markdown code block like this:
+```json
+{
+  "emotional_state": "...",
+  "sentiment": {
+    "classification": "...",
+    "justification": "..."
+  },
+  "confidence_level": "...",
+  "key_observations": [
+    {"type": "visual_cue", "detail": "..."},
+    {"type": "auditory_cue", "detail": "..."}
+  ]
+}
+```
+""")
+    return "\n".join(prompt_parts)
+
+def _generate_analysis(client, model_name, contents):
+    """Calls Gemini and returns markdown plus parsed JSON."""
+    response = _call_with_retries(
+        lambda: client.models.generate_content(model=model_name, contents=contents),
+        "Generating analysis",
+    )
+    full_markdown = response.text
+    json_data = parse_json_from_markdown(full_markdown)
+    logging.info("Successfully received and parsed response from Gemini.")
+    return full_markdown, json_data
+
 def analyze_video_with_gemini(video_path, model_name, focus, language):
     """
     Analyzes a video file directly using a Gemini model, including audio.
@@ -179,61 +244,7 @@ def analyze_video_with_gemini(video_path, model_name, focus, language):
         return None, None
 
     logging.info(f"Analyzing video and audio with {model_name}...")
-
-    # Dynamically build the prompt for video and audio analysis
-    prompt_parts = [
-        "You are an expert in behavioral analysis, skilled in interpreting both visual and auditory cues.",
-        "Analyze the provided video file, paying attention to both the visual elements and the audio track."
-    ]
-    if focus:
-        prompt_parts.append(f"Your analysis should focus on: {focus}.")
-    else:
-        prompt_parts.append("Focus on the primary individual visible and audible in the video.")
-
-    prompt_parts.append("Based on their facial expressions, body language, gestures, tone of voice, and speech patterns, please provide a comprehensive report in Markdown format.")
-    
-    if language:
-        prompt_parts.append(f"The report must be written in {language}.")
-
-    prompt_parts.append("""
-The report should include the following sections:
-
-## Overall Emotional State
-- A summary of the person's dominant emotional state, considering both visual and auditory cues.
-
-## Sentiment Analysis
-- Classify the overall sentiment as Positive, Negative, or Neutral, justifying your answer with evidence from both video and audio.
-
-## Detailed Observations
-- **Visual Cues:** Describe specific facial expressions, posture, and body movements (e.g., fidgeting, leaning forward, breaking eye contact).
-- **Auditory Cues:** Describe the tone of voice (e.g., wavering, confident, monotone), pace of speech, use of filler words, and any notable pauses or hesitations.
-- **Potential Inferred Feelings:** Infer potential feelings (e.g., nervousness, confidence, deception, honesty) and support your inferences with specific, timestamped examples from the video if possible.
-
-## Confidence Level
-- Assess the person's apparent confidence level on a scale of Low, Medium, or High, explaining your reasoning based on both visual and auditory evidence.
-
-## Summary
-- Conclude with a brief, holistic summary of your findings.
-
-Finally, after the summary, provide a JSON object containing the key findings. The JSON object should be enclosed in a Markdown code block like this:
-```json
-{
-  "emotional_state": "...",
-  "sentiment": {
-    "classification": "...",
-    "justification": "..."
-  },
-  "confidence_level": "...",
-  "key_observations": [
-    {"type": "visual_cue", "detail": "..."},
-    {"type": "auditory_cue", "detail": "..."}
-  ]
-}
-```
-""")
-    
-    prompt = "\n".join(prompt_parts)
-
+    prompt = _video_analysis_prompt(focus, language)
     mime_type = video_file.mime_type or "video/mp4"
     contents = [
         prompt,
@@ -241,19 +252,32 @@ Finally, after the summary, provide a JSON object containing the key findings. T
     ]
 
     try:
-        response = _call_with_retries(
-            lambda: client.models.generate_content(model=model_name, contents=contents),
-            "Generating analysis",
-        )
-        full_markdown = response.text
-        json_data = parse_json_from_markdown(full_markdown)
-        logging.info("Successfully received and parsed response from Gemini.")
-        return full_markdown, json_data
+        return _generate_analysis(client, model_name, contents)
     except Exception as e:
         logging.error(f"An error occurred during the Gemini API call: {e}")
         return None, None
     finally:
         _delete_uploaded_file(client, video_file)
+
+def analyze_youtube_with_gemini(youtube_url, model_name, focus, language):
+    """
+    Analyzes a public YouTube video by passing the URL to Gemini.
+    The video is not downloaded or uploaded.
+    """
+    client = _get_client()
+    if client is None:
+        return None, None
+
+    logging.info(f"Analyzing YouTube URL with {model_name}: {youtube_url}")
+    contents = [
+        types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
+        _video_analysis_prompt(focus, language),
+    ]
+    try:
+        return _generate_analysis(client, model_name, contents)
+    except Exception as e:
+        logging.error(f"An error occurred during the Gemini API call: {e}")
+        return None, None
 
 def _delete_uploaded_file(client, video_file):
     """Deletes an uploaded Gemini file, ignoring cleanup failures."""

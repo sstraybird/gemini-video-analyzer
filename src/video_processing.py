@@ -14,9 +14,16 @@ def is_youtube_url(url):
     """Checks if the given string is a valid YouTube URL."""
     youtube_regex = (
         r'(https?://)?(www\.)?'
-        '(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
+        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
+        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
     return re.match(youtube_regex, url)
+
+def youtube_report_name(url):
+    """Builds a filesystem-safe report name from a YouTube video id."""
+    match = is_youtube_url(url)
+    video_id = match.group(6) if match else "video"
+    safe_id = re.sub(r"[^\w\-]", "_", video_id)
+    return f"youtube-{safe_id}"
 
 def download_youtube_video(url):
     """
