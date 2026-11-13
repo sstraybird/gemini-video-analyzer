@@ -1,10 +1,12 @@
 import os
-import google.generativeai as genai
+import time
+import mimetypes
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import logging
 import re
 import json
-from tqdm import tqdm
 
 def parse_json_from_markdown(markdown_text):
     """Extracts and parses a JSON object from a Markdown code block."""
@@ -22,6 +24,34 @@ def parse_json_from_markdown(markdown_text):
         logging.error(f"An unexpected error occurred during JSON parsing: {e}")
     return None
 
+def _file_state_name(video_file):
+    """Returns the File API state as a plain string."""
+    state = getattr(video_file, "state", None)
+    if state is None:
+        return ""
+    return getattr(state, "name", None) or str(state)
+
+def _call_with_retries(action, description, attempts=5):
+    """Retries a Gemini call after transient proxy or connection errors."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return action()
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            logging.warning(f"{description} failed ({attempt}/{attempts}): {e}. Retrying...")
+            time.sleep(5 * attempt)
+
+def _get_client():
+    """Loads the API key and returns a Gemini client, or None if unset."""
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logging.critical("GEMINI_API_KEY not found. Please set it in a .env file.")
+        return None
+    # Long enough for a large video upload and a long generation through a proxy.
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=3_600_000))
+
 def analyze_frames_with_gemini(frames, model_name, focus, language):
     """
     Analyzes frames using a Gemini model and returns the full markdown
@@ -32,17 +62,10 @@ def analyze_frames_with_gemini(frames, model_name, focus, language):
         logging.warning("No frames were provided for analysis.")
         return None, None
 
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logging.critical("GEMINI_API_KEY not found. Please set it in a .env file.")
+    client = _get_client()
+    if client is None:
         return None, None
-    genai.configure(api_key=api_key)
-
-    model = genai.GenerativeModel(f'models/{model_name}')
     logging.info(f"Analyzing frames with {model_name}...")
-
-    image_parts = [{"mime_type": "image/jpeg", "data": frame} for frame in frames]
 
     prompt_parts = [
         "You are an expert in behavioral analysis and non-verbal communication.",
@@ -96,9 +119,12 @@ Finally, after the summary, provide a JSON object containing the key findings. T
 """)
     
     prompt = "\n".join(prompt_parts)
+    contents = [prompt] + [
+        types.Part.from_bytes(data=frame, mime_type="image/jpeg") for frame in frames
+    ]
 
     try:
-        response = model.generate_content([prompt] + image_parts)
+        response = client.models.generate_content(model=model_name, contents=contents)
         full_markdown = response.text
         json_data = parse_json_from_markdown(full_markdown)
         logging.info("Successfully received and parsed response from Gemini.")
@@ -112,28 +138,44 @@ def analyze_video_with_gemini(video_path, model_name, focus, language):
     Analyzes a video file directly using a Gemini model, including audio.
     Returns the full markdown and a parsed JSON object.
     """
-    load_dotenv()
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logging.critical("GEMINI_API_KEY not found. Please set it in a .env file.")
+    client = _get_client()
+    if client is None:
         return None, None
-    genai.configure(api_key=api_key)
 
-    model = genai.GenerativeModel(f'models/{model_name}')
     logging.info(f"Uploading video file: {video_path}...")
-    
-    # Upload the video file
-    video_file = genai.upload_file(path=video_path)
-    logging.info(f"Successfully uploaded {video_file.display_name}.")
+    mime_type, _ = mimetypes.guess_type(video_path)
+    if not mime_type:
+        mime_type = "video/mp4"
+    video_file = None
+    try:
+        # Pass an open file so the SDK does not put a non-ASCII path into an HTTP header.
+        with open(video_path, "rb") as video_handle:
+            video_file = client.files.upload(
+                file=video_handle,
+                config=types.UploadFileConfig(mime_type=mime_type, display_name="video.mp4"),
+            )
+    except Exception as e:
+        logging.error(f"An error occurred during the Gemini API call: {e}")
+        return None, None
+    logging.info(f"Successfully uploaded {video_file.display_name or video_file.name}.")
 
-    # Wait for the file to be processed
-    while video_file.state.name == "PROCESSING":
-        print('.', end='', flush=True)
-        video_file = genai.get_file(video_file.name)
-    print() # Newline after processing dots
+    try:
+        while _file_state_name(video_file) == "PROCESSING":
+            time.sleep(10)
+            file_name = video_file.name
+            video_file = _call_with_retries(
+                lambda: client.files.get(name=file_name),
+                "Checking file state",
+            )
+            logging.info(f"File state: {_file_state_name(video_file)}")
+    except Exception as e:
+        logging.error(f"An error occurred during the Gemini API call: {e}")
+        _delete_uploaded_file(client, video_file)
+        return None, None
 
-    if video_file.state.name == "FAILED":
+    if _file_state_name(video_file) == "FAILED":
         logging.error(f"Video processing failed for {video_path}.")
+        _delete_uploaded_file(client, video_file)
         return None, None
 
     logging.info(f"Analyzing video and audio with {model_name}...")
@@ -192,17 +234,33 @@ Finally, after the summary, provide a JSON object containing the key findings. T
     
     prompt = "\n".join(prompt_parts)
 
+    mime_type = video_file.mime_type or "video/mp4"
+    contents = [
+        prompt,
+        types.Part.from_uri(file_uri=video_file.uri, mime_type=mime_type),
+    ]
+
     try:
-        response = model.generate_content([prompt, video_file])
+        response = _call_with_retries(
+            lambda: client.models.generate_content(model=model_name, contents=contents),
+            "Generating analysis",
+        )
         full_markdown = response.text
         json_data = parse_json_from_markdown(full_markdown)
-        
-        # Clean up the uploaded file
-        genai.delete_file(video_file.name)
-        logging.info(f"Cleaned up uploaded file: {video_file.name}")
-        
         logging.info("Successfully received and parsed response from Gemini.")
         return full_markdown, json_data
     except Exception as e:
         logging.error(f"An error occurred during the Gemini API call: {e}")
         return None, None
+    finally:
+        _delete_uploaded_file(client, video_file)
+
+def _delete_uploaded_file(client, video_file):
+    """Deletes an uploaded Gemini file, ignoring cleanup failures."""
+    if video_file is None or not getattr(video_file, "name", None):
+        return
+    try:
+        client.files.delete(name=video_file.name)
+        logging.info(f"Cleaned up uploaded file: {video_file.name}")
+    except Exception as e:
+        logging.warning(f"Failed to delete uploaded file {video_file.name}: {e}")

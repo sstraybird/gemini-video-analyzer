@@ -36,13 +36,13 @@ def main():
     
     parser.add_argument(
         "-m", "--model", 
-        choices=['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.5-flash', 'gemini-2.5-pro'],
-        default='gemini-2.5-pro',
+        choices=['gemini-3.5-flash', 'gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-1.5-flash', 'gemini-1.5-pro'],
+        default='gemini-3.5-flash',
         help='''The Gemini model to use for analysis.
-- gemini-1.5-flash: Fast and cost-effective.
-- gemini-1.5-pro:   Higher quality, more detailed analysis.
-- gemini-2.5-flash: The next-generation fast and efficient model.
-- gemini-2.5-pro:   (Default) The state-of-the-art model for highest quality analysis.'''
+- gemini-3.5-flash: (Default) Available to current API keys.
+- gemini-3.8-flash: Newer flash model; may be capacity-limited.
+- gemini-2.5-flash / gemini-2.5-pro: Rejected for new API keys.
+- gemini-1.5-flash / gemini-1.5-pro: Older models.'''
     )
     
     parser.add_argument(
